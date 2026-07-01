@@ -325,7 +325,7 @@ _mic_workers: dict[int, asyncio.Task] = {}
 _mic_pending: set[tuple[int, int]] = set()
 
 # Jeda antar tindakan mic dalam satu grup (detik)
-_MIC_WORKER_DELAY = 2.0
+_MIC_WORKER_DELAY = 0.3
 
 
 def _get_mic_queue(chat_id: int) -> asyncio.Queue:
