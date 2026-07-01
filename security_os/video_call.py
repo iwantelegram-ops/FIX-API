@@ -939,7 +939,22 @@ _admin_fetch_in_progress: set[int] = set()
 
 async def _get_group_admin_ids(chat_id: int) -> set[int]:
     """
-    Ambil set user_id admin grup, dengan cache 5 menit.
+    Ambil set user_id admin grup, dengan cache 5 menit di memory.
+
+    SUMBER DATA (sejak update admin-roster):
+      Baca dari group_admin_roster di DB — daftar ini disinkronkan REAKTIF
+      oleh bot utama tiap kali ada promote/demote admin (lihat
+      plugins/nexus/nexus_group.py) dan di-bootstrap otomatis saat grup
+      pertama dikenali. Userbot TIDAK LAGI panggil Telegram API sendiri
+      untuk ini di kondisi normal — cukup query Mongo/SQLite.
+
+      Fallback: kalau roster grup ini belum pernah dibuat sama sekali
+      (None — bukan cuma "kosong"), baru userbot scan sendiri via
+      get_chat_members() SEKALI, sekaligus menulis hasilnya ke DB supaya
+      panggilan berikutnya sudah tidak perlu API lagi (self-healing).
+      Kondisi ini seharusnya jarang terjadi (mis. grup lama sebelum fitur
+      roster ini ada, dan reconciliation harian belum sempat jalan).
+
     Return set kosong jika error — lebih aman skip check daripada false-kick admin.
     Dipanggil sebelum loop scan peserta VC untuk skip admin dari pengecekan.
     """
@@ -948,20 +963,39 @@ async def _get_group_admin_ids(chat_id: int) -> set[int]:
         ids, ts = cached
         if time.monotonic() - ts < _ADMIN_CACHE_TTL:
             return ids
-    if not userbot:
-        return set()
+
     # Guard: jika sudah ada fetch in-progress untuk grup ini, pakai cache lama
     if chat_id in _admin_fetch_in_progress:
         return _admin_cache.get(chat_id, (set(), 0.0))[0]
     _admin_fetch_in_progress.add(chat_id)
     try:
+        try:
+            from database import get_admin_roster
+            roster = await get_admin_roster(chat_id)
+        except Exception as e:
+            print(f"[UB-VC] Gagal baca admin roster grup {chat_id} dari DB: {e}")
+            roster = None
+
+        if roster is not None:
+            # Roster sudah pernah dibuat (bisa saja memang kosong — itu sah)
+            _admin_cache[chat_id] = (roster, time.monotonic())
+            return roster
+
+        # Roster belum pernah ada sama sekali → fallback scan API + self-heal
+        if not userbot:
+            return set()
         from pyrogram.enums import ChatMembersFilter
         admin_ids: set[int] = set()
         async for member in userbot.get_chat_members(chat_id, filter=ChatMembersFilter.ADMINISTRATORS):
             if member.user and member.user.id:
                 admin_ids.add(member.user.id)
         _admin_cache[chat_id] = (admin_ids, time.monotonic())
-        print(f"[UB-VC] Admin grup {chat_id}: {len(admin_ids)} admin di-cache.")
+        print(f"[UB-VC] Admin grup {chat_id}: {len(admin_ids)} admin (fallback API, roster belum ada).")
+        try:
+            from database import set_admin_roster
+            await set_admin_roster(chat_id, admin_ids)
+        except Exception as e:
+            print(f"[UB-VC] Gagal tulis balik roster grup {chat_id} ke DB: {e}")
         return admin_ids
     except FloodWait as fw:
         await asyncio.sleep(fw.value + 1)
