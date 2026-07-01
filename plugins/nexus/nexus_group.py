@@ -55,11 +55,18 @@ from database import (
     is_admin,
     force_disable_group_moderation,
     restore_group_moderation_if_forced,
+    get_admin_roster,
+    admin_roster_upsert_user,
+    bootstrap_admin_roster,
 )
 
 _free_col   = db["free_per_group"]
 LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", 0))
 TZ_WIB      = timezone(timedelta(hours=7))
+
+# Guard: cegah bootstrap_admin_roster berjalan dobel untuk grup yang sama
+# secara bersamaan (mis. event ChatMemberUpdated datang beruntun cepat).
+_admin_roster_bootstrap_in_progress: set[int] = set()
 
 from plugins.nexus.engine import pipeline_pembersihan, generate_regex_otomatis_async
 from core.punishment import check_and_punish
@@ -998,14 +1005,40 @@ async def nexus_tracking_grup(client: Client, update: ChatMemberUpdated):
             await nexus_remove_grup(chat_id)
         elif new_status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER):
             await nexus_track_grup(chat_id, update.chat.title or str(chat_id), update.chat.username)
+            asyncio.create_task(_maybe_bootstrap_admin_roster(client, chat_id))
     except Exception as e:
         print(f"[nexus_tracking_grup] {e}")
+
+
+async def _maybe_bootstrap_admin_roster(client: Client, chat_id: int) -> None:
+    """
+    Isi group_admin_roster untuk grup ini kalau belum pernah dibuat sama
+    sekali. Dipanggil setiap kali bot "dikenali" masuk/berstatus di grup ini
+    (nexus_tracking_grup) — tapi hanya benar-benar scan sekali; panggilan
+    berikutnya untuk grup yang sama akan langsung skip karena roster != None.
+    Dijalankan sebagai background task agar tidak menunda handler utama.
+    """
+    if chat_id in _admin_roster_bootstrap_in_progress:
+        return
+    _admin_roster_bootstrap_in_progress.add(chat_id)
+    try:
+        existing = await get_admin_roster(chat_id)
+        if existing is None:
+            await bootstrap_admin_roster(client, chat_id)
+    except Exception as e:
+        print(f"[AdminRoster] Bootstrap awal gagal grup {chat_id}: {e}")
+    finally:
+        _admin_roster_bootstrap_in_progress.discard(chat_id)
 
 
 @Client.on_chat_member_updated(group=9)
 async def nexus_track_admin_demotion(client: Client, update: ChatMemberUpdated):
     """
-    Deteksi admin yang di-demosi dan cabut sesi DM-nya.
+    Deteksi perubahan status admin (promote/demote) untuk 2 tujuan:
+      1. Demote → cabut sesi DM panel admin (perilaku lama, tidak diubah).
+      2. Promote/demote apapun → sinkronkan ke group_admin_roster (persisten
+         di DB) secara incremental, supaya userbot Security OS bisa baca
+         daftar admin dari DB tanpa perlu panggil Telegram API sendiri.
     group=9 — jalan setelah nexus_tracking_grup (group=8).
     """
     try:
@@ -1018,9 +1051,18 @@ async def nexus_track_admin_demotion(client: Client, update: ChatMemberUpdated):
         was_admin = old_status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
         now_admin = new_status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
 
+        if was_admin == now_admin:
+            return  # tidak ada perubahan status admin — tidak ada yang perlu disinkronkan
+
+        target_uid = update.new_chat_member.user.id
+        chat_id    = update.chat.id
+
+        # Sinkronkan roster persisten (aman dipanggil walau roster grup ini
+        # belum pernah di-bootstrap — akan diabaikan diam-diam sampai
+        # bootstrap pertama selesai, lihat admin_roster_upsert_user()).
+        await admin_roster_upsert_user(chat_id, target_uid, now_admin)
+
         if was_admin and not now_admin:
-            demoted_uid = update.new_chat_member.user.id
-            chat_id     = update.chat.id
-            _adm_sess.on_admin_demoted(demoted_uid, chat_id)
+            _adm_sess.on_admin_demoted(target_uid, chat_id)
     except Exception as e:
         print(f"[nexus_track_admin_demotion] {e}")
