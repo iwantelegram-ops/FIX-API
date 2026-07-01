@@ -1265,7 +1265,7 @@ async def _migrate_legacy_data():
         "regex_per_group", "whitelist_per_group", "free_per_group",
         "nexus_kalimat", "nexus_regex", "nexus_grup", "nexus_whitelist",
         "nexus_actlog", "local_mute", "group_action_log",
-        "ai_debug_log", "dm_users", "nexus_ai_model", "bot_config",
+        "ai_debug_log", "dm_users", "nexus_ai_model", "bot_config", "group_admin_roster",
     ]
 
     migrated_total = 0
@@ -1407,7 +1407,7 @@ async def _migrate_sqlite_to_mongo():
         "regex_per_group", "whitelist_per_group", "free_per_group",
         "nexus_kalimat", "nexus_regex", "nexus_grup", "nexus_whitelist",
         "local_mute", "group_action_log",
-        "nexus_actlog", "ai_debug_log", "dm_users", "nexus_ai_model", "bot_config",
+        "nexus_actlog", "ai_debug_log", "dm_users", "nexus_ai_model", "bot_config", "group_admin_roster",
     ]
 
     total_migrated = 0
@@ -1523,6 +1523,11 @@ async def _create_panel_indexes() -> None:
         # vc_muted_by_ub — dicek tiap /unmutemic dan tiap siklus scan VC
         await db["vc_muted_by_ub"].create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)])
 
+        # group_admin_roster — dibaca userbot Security OS tiap siklus scan VC
+        # (gantikan panggilan Telegram API langsung — lihat database.py bagian
+        # "ADMIN ROSTER" dan security_os/video_call.py _get_group_admin_ids).
+        await db["group_admin_roster"].create_index([("chat_id", ASCENDING)], unique=True)
+
         # seen_messages (messages_db) — dicek SETIAP pesan yang lolos sampai
         # tahap Anti Duplikasi Lokal (core/antispam_queue.py), baik untuk
         # cari pesan lama yang mirip (find().sort("time",-1).limit(N)) maupun
@@ -1554,7 +1559,7 @@ async def setup_db():
             "regex_per_group", "whitelist_per_group", "free_per_group",
             "nexus_kalimat", "nexus_regex", "nexus_grup", "nexus_whitelist",
             "local_mute", "group_action_log",
-            "nexus_actlog", "ai_debug_log", "dm_users", "nexus_ai_model", "bot_config",
+            "nexus_actlog", "ai_debug_log", "dm_users", "nexus_ai_model", "bot_config", "group_admin_roster",
             "security_os", "security_os_monitors",
             "mention_member_cache",
         ]:
@@ -1657,7 +1662,7 @@ async def reset_code_bot_data(code_bot: str) -> tuple[int, list[str]]:
         "regex_per_group", "whitelist_per_group", "free_per_group",
         "nexus_kalimat", "nexus_regex", "nexus_grup", "nexus_whitelist",
         "nexus_actlog", "local_mute", "group_action_log",
-        "ai_debug_log", "dm_users", "nexus_ai_model", "bot_config",
+        "ai_debug_log", "dm_users", "nexus_ai_model", "bot_config", "group_admin_roster",
     ]
 
     cleared: list[str] = []
@@ -2078,6 +2083,130 @@ async def is_admin(client, chat_id: int, user_id) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ADMIN ROSTER — daftar admin per grup, PERSISTEN ke DB (bukan in-memory saja).
+# ══════════════════════════════════════════════════════════════════════════════
+# Tujuan: userbot Security OS (security_os/video_call.py) butuh tahu siapa saja
+# admin grup untuk skip mereka dari pengecekan VC — sebelumnya userbot query
+# Telegram API sendiri (get_chat_members ADMINISTRATORS) tiap 5 menit per grup
+# lewat akun MTProto-nya. Sekarang datanya dibaca dari sini (DB bersama),
+# diisi/disinkronkan REAKTIF oleh bot utama lewat on_chat_member_updated
+# (lihat plugins/nexus/nexus_group.py) — userbot jadi tidak perlu panggil API
+# sama sekali untuk keperluan ini di kondisi normal.
+#
+# doc schema: {chat_id, admin_ids: [int, ...], updated_at: float}
+#
+# PENTING — beda None vs set kosong:
+#   None       = roster BELUM PERNAH dibuat untuk grup ini (belum di-bootstrap)
+#   set()      = roster SUDAH ada, dan memang grup ini terdeteksi 0 admin
+# Caller (userbot) HARUS treat ini beda: None → boleh fallback ke API sekali
+# lalu bootstrap; set kosong → percaya saja, JANGAN fallback ke API.
+
+async def get_admin_roster(chat_id: int) -> "set[int] | None":
+    """Baca roster admin grup dari DB. None jika belum pernah di-bootstrap."""
+    try:
+        doc = await db["group_admin_roster"].find_one({"chat_id": chat_id})
+    except Exception as e:
+        print(f"[AdminRoster] Gagal baca roster grup {chat_id}: {e}")
+        return None
+    if doc is None:
+        return None
+    return set(doc.get("admin_ids") or [])
+
+
+async def set_admin_roster(chat_id: int, admin_ids: "set[int]") -> None:
+    """Timpa penuh roster admin grup ini. Dipakai saat bootstrap/reconcile."""
+    try:
+        await db["group_admin_roster"].update_one(
+            {"chat_id": chat_id},
+            {"$set": {
+                "chat_id":    chat_id,
+                "admin_ids":  sorted(admin_ids),
+                "updated_at": time.time(),
+            }},
+            upsert=True,
+        )
+    except Exception as e:
+        print(f"[AdminRoster] Gagal simpan roster grup {chat_id}: {e}")
+
+
+async def admin_roster_upsert_user(chat_id: int, user_id: int, is_admin_now: bool) -> None:
+    """
+    Update 1 user_id di roster (promote → tambah, demote → hapus) TANPA
+    full rescan — dipanggil reaktif dari on_chat_member_updated.
+
+    Jika roster grup ini belum pernah dibuat (None), operasi diabaikan diam-
+    diam — nanti otomatis terisi lewat bootstrap_admin_roster() saat grup
+    pertama kali dikenali, atau lewat reconciliation harian.
+    """
+    current = await get_admin_roster(chat_id)
+    if current is None:
+        return
+    if is_admin_now:
+        current.add(user_id)
+    else:
+        current.discard(user_id)
+    await set_admin_roster(chat_id, current)
+
+
+async def bootstrap_admin_roster(client, chat_id: int) -> "set[int]":
+    """
+    Full scan admin grup via bot utama (client), lalu simpan sebagai roster
+    baru (menimpa yang lama). Dipanggil saat:
+      - Grup baru pertama kali dikenali bot (nexus_tracking_grup).
+      - Reconciliation harian (admin_roster_reconcile_loop) — jaring pengaman
+        kalau ada event promote/demote yang ter-skip (mis. bot restart/down).
+
+    Return set kosong (dan tidak menyimpan apapun) jika scan gagal total —
+    lebih aman biarkan roster lama/absen daripada menimpanya dengan data
+    kosong yang salah.
+    """
+    from pyrogram.enums import ChatMembersFilter
+    admin_ids: set[int] = set()
+    try:
+        async for member in client.get_chat_members(chat_id, filter=ChatMembersFilter.ADMINISTRATORS):
+            if member.user and member.user.id:
+                admin_ids.add(member.user.id)
+    except Exception as e:
+        print(f"[AdminRoster] Bootstrap gagal grup {chat_id}: {e}")
+        return set()
+    await set_admin_roster(chat_id, admin_ids)
+    print(f"[AdminRoster] Bootstrap grup {chat_id}: {len(admin_ids)} admin disimpan ke roster.")
+    return admin_ids
+
+
+async def admin_roster_reconcile_loop(client) -> None:
+    """
+    Jaring pengaman harian: re-scan penuh admin roster SEMUA grup dikenal.
+
+    Kenapa masih perlu ini walau sudah ada update reaktif per-event:
+    Telegram TIDAK backfill ChatMemberUpdated yang terlewat saat bot mati/
+    restart — jadi kalau ada promote/demote yang terjadi persis di window
+    downtime, roster bisa basi selamanya tanpa reconciliation ini.
+
+    Jeda antar grup kecil (2 detik) supaya tidak membanjiri Telegram API
+    sekaligus untuk banyak grup — ini SATU-SATUNYA sumber panggilan API di
+    seluruh sistem admin-roster, dan cuma jalan 1x/hari.
+    """
+    while True:
+        try:
+            await asyncio.sleep(86400)  # 24 jam
+            ids = await get_all_known_group_ids()
+            print(f"[AdminRoster] Reconciliation harian dimulai — {len(ids)} grup.")
+            for chat_id in ids:
+                try:
+                    await bootstrap_admin_roster(client, chat_id)
+                except Exception as e:
+                    print(f"[AdminRoster] Reconcile gagal grup {chat_id}: {e}")
+                await asyncio.sleep(2)
+            print("[AdminRoster] Reconciliation harian selesai.")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[AdminRoster] Reconcile loop error: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+
 # AUTO DELETE / DELETE WORKER
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2622,6 +2751,10 @@ async def remove_group_data(chat_id: int) -> None:
     keys_to_remove = [k for k in _admin_cache if k[0] == chat_id]
     for k in keys_to_remove:
         _admin_cache.pop(k, None)
+    try:
+        await db["group_admin_roster"].delete_one({"chat_id": chat_id})
+    except Exception as e:
+        print(f"[AdminRoster] Gagal hapus roster grup {chat_id}: {e}")
     print(f"[DB] Data grup {chat_id} dihapus (bot dikeluarkan).")
 
 

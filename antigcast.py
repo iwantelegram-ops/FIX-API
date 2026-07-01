@@ -1016,6 +1016,16 @@ async def main():
     from core.perm_watchdog import perm_watchdog_loop
     asyncio.create_task(perm_watchdog_loop(app))
 
+    # Background task admin_roster_reconcile_loop — jaring pengaman harian
+    # untuk group_admin_roster (dipakai userbot Security OS, lihat
+    # database.py bagian "ADMIN ROSTER"). Update reaktif via
+    # on_chat_member_updated (nexus_group.py) sudah menutup sebagian besar
+    # kasus, tapi event yang ter-skip saat bot restart/down tidak pernah
+    # di-backfill Telegram — loop ini re-scan penuh 1x/24 jam sebagai
+    # cadangan supaya roster tidak basi selamanya.
+    from database import admin_roster_reconcile_loop
+    asyncio.create_task(admin_roster_reconcile_loop(app))
+
     # Background task panel_write_worker — menulis ke DB hasil tombol panel
     # (toggle, +/-, dsb) secara antri. Client diteruskan agar worker bisa
     # mengoreksi tampilan panel di DM admin jika penulisan gagal permanen.
